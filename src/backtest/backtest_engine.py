@@ -58,6 +58,13 @@ class BacktestConfig:
     # in bt.core.SecurityBase.allocate stops approaching the target outlay).
     # bt's own cost-model example uses fractional shares for the same reason.
     integer_positions: bool = True
+    # When False (default, existing behaviour) the forward-filled weights are
+    # re-targeted on every trading day, so drift is rebalanced away daily
+    # (paying transaction costs each time). When True the engine only trades
+    # on the dates present in `weight_signals` (a signal falling on a
+    # non-trading day is executed on the next trading day) and lets positions
+    # drift in between — the natural mode for monthly / quarterly strategies.
+    rebalance_on_signal_dates_only: bool = False
 
     def __post_init__(self):
         if self.benchmark_tickers is None:
@@ -149,8 +156,18 @@ class BacktestEngine:
             # Keep only tickers present in price data
             common_cols = [c for c in ws.columns if c in price_data_clean.columns]
             ws = ws[common_cols]
+            trading_index = price_data_clean.index
+            rebalance_dates = None
+            if getattr(self.config, 'rebalance_on_signal_dates_only', False):
+                # Map each signal date onto the first trading day on/after it
+                # and carry the signal's weights there, so signals dated on
+                # weekends / holidays are not lost.
+                pos = trading_index.searchsorted(ws.index, side='left')
+                rebalance_dates = sorted({trading_index[p] for p in pos
+                                          if p < len(trading_index)})
+                ws = ws.reindex(ws.index.union(trading_index)).ffill()
             # Reindex to full trading index and forward-fill weights
-            ws = ws.reindex(price_data_clean.index).ffill()
+            ws = ws.reindex(trading_index).ffill()
             # Fill any remaining NaNs with 0 (before first signal)
             ws = ws.fillna(0.0)
             # Normalize rows where sum > 0
@@ -160,7 +177,9 @@ class BacktestEngine:
                 ws.loc[nonzero] = ws.loc[nonzero].div(row_sum[nonzero], axis=0)
 
             # Create bt strategy from aligned weights
-            bt_strategy = self._create_bt_strategy(strategy_name, ws)
+            bt_strategy = self._create_bt_strategy(
+                strategy_name, ws, rebalance_dates=rebalance_dates
+            )
 
             # Build the bt.Backtest. When a CostModel is configured, route it
             # through the new bt cost-model API together with volume +
@@ -318,8 +337,15 @@ class BacktestEngine:
             integer_positions=integer_positions,
         )
 
-    def _create_bt_strategy(self, strategy_name: str, weight_signals: pd.DataFrame) -> bt.Strategy:
-        """Create bt strategy from weight signals."""
+    def _create_bt_strategy(self, strategy_name: str, weight_signals: pd.DataFrame,
+                            rebalance_dates: Optional[List[pd.Timestamp]] = None
+                            ) -> bt.Strategy:
+        """Create bt strategy from weight signals.
+
+        The strategy rebalances to the target weights on every date in
+        ``weight_signals.index`` (or only on ``rebalance_dates`` when given),
+        including the first signal date.
+        """
         # Ensure weight_signals has datetime index
         if not isinstance(weight_signals.index, pd.DatetimeIndex):
             weight_signals.index = pd.to_datetime(weight_signals.index)
@@ -327,12 +353,15 @@ class BacktestEngine:
         # Normalize weights to sum to 1 per row
         weight_signals = weight_signals.div(weight_signals.sum(axis=1), axis=0).fillna(0)
         tw = weight_signals.sort_index()
+        run_dates = tw.index.tolist() if rebalance_dates is None else list(rebalance_dates)
 
+        # NB: no RunAfterDate here. bt's RunAfterDate passes only when
+        # `now > date` (strictly after), which silently skipped the first
+        # signal date. RunOnDate alone already prevents trading before it.
         strategy = bt.Strategy(
             strategy_name,
             [
-                bt.algos.RunAfterDate(tw.index.min()),
-                bt.algos.RunOnDate(*tw.index.tolist()),
+                bt.algos.RunOnDate(*run_dates),
                 bt.algos.SelectThese(list(tw.columns)),
                 bt.algos.WeighTarget(tw),
                 bt.algos.Rebalance()
