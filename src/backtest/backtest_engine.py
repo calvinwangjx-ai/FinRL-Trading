@@ -165,9 +165,12 @@ class BacktestEngine:
                 pos = trading_index.searchsorted(ws.index, side='left')
                 rebalance_dates = sorted({trading_index[p] for p in pos
                                           if p < len(trading_index)})
-                ws = ws.reindex(ws.index.union(trading_index)).ffill()
-            # Reindex to full trading index and forward-fill weights
-            ws = ws.reindex(trading_index).ffill()
+            # Forward-fill over the union of signal dates and trading days
+            # before restricting to the trading calendar, so a signal dated on
+            # a weekend / holiday takes effect on the next trading day instead
+            # of being dropped by the reindex.
+            ws = ws.reindex(ws.index.union(trading_index)).ffill()
+            ws = ws.reindex(trading_index)
             # Fill any remaining NaNs with 0 (before first signal)
             ws = ws.fillna(0.0)
             # Normalize rows where sum > 0

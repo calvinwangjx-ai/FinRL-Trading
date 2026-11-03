@@ -133,3 +133,38 @@ def test_rebalance_on_signal_dates_only():
     positions = res.backtests["s"].strategy.positions
     assert positions.loc[d1, "AAA"] > 0 and positions.loc[d1, "BBB"] > 0
     assert positions.loc[monday, "BBB"] == 0
+
+
+def test_default_path_carries_non_trading_day_signal_forward():
+    prices = _prices()
+    d1 = prices.index[2]
+    # Second signal dated on a Saturday -> must take effect the following
+    # Monday, not be dropped by the reindex onto the trading calendar.
+    sat = pd.Timestamp("2018-03-10")
+    friday = pd.Timestamp("2018-03-09")
+    monday = pd.Timestamp("2018-03-12")
+    assert sat not in prices.index and monday in prices.index
+    weights = pd.DataFrame(
+        {"AAA": [1.0, 0.0], "BBB": [0.0, 1.0]}, index=[d1, sat]
+    )
+    engine = _engine(integer_positions=False)
+
+    captured = {}
+    orig = engine._create_bt_strategy
+
+    def spy(name, ws, rebalance_dates=None):
+        captured["rebalance_dates"] = rebalance_dates
+        captured["ws"] = ws
+        return orig(name, ws, rebalance_dates=rebalance_dates)
+
+    engine._create_bt_strategy = spy
+    engine.run_backtest("s", prices, weights)
+
+    ws = captured["ws"]
+    assert captured["rebalance_dates"] is None
+    # Old weights stay in force through Friday ...
+    assert ws.loc[friday, "AAA"] == pytest.approx(1.0)
+    assert ws.loc[friday, "BBB"] == pytest.approx(0.0)
+    # ... and the Saturday signal's weights apply from Monday onward.
+    assert (ws.loc[monday:, "AAA"] == 0.0).all()
+    assert ws.loc[monday:, "BBB"].to_numpy() == pytest.approx(1.0)
